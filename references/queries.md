@@ -1,0 +1,140 @@
+# Running queries, and reading the catalog and the history
+
+Read this when you are about to run SQL, when you need to know what is in a database,
+or when you want to know what has already been run against it.
+
+## Finding out what is there
+
+`--catalog` and `--catalog-search` exit without running SQL, and both are rows, so every
+format and output option applies to them.
+
+```bash
+hsql -P prod --catalog                            # databases
+hsql -P prod --catalog --path mydb                # that database's schemas
+hsql -P prod --catalog --path mydb.analytics      # that schema's tables and views
+hsql -P prod --catalog --path mydb.analytics.orders   # that table's columns and types
+hsql -P prod --catalog --path 'mydb.analytics.ord*'   # a trailing * filters a listing
+hsql -P prod --catalog-search customer_id         # every level at once, by name
+hsql -P prod --catalog-search order --path mydb.analytics  # narrowed to a subtree
+```
+
+Each row has five columns: `path` (what lists that object's own children), `name`,
+`query_name` (already quoted correctly for this database — paste this into SQL, do not
+build the identifier yourself), `type`, and `type_label`.
+
+Not every adapter implements search. Check before you rely on it:
+
+```bash
+hsql --info -a postgres    # look at .adapters.postgres.capabilities
+```
+
+An adapter that cannot search says so and exits rather than walking its whole catalog.
+
+## Reading the query history
+
+Harlequin and hsql record every statement they run in one local SQLite file, so
+`--history` is what the humans and agents on this machine have already been doing. Read
+it before writing a query from scratch: the query you need has often been written.
+
+```bash
+hsql --history                       # every database, newest first
+hsql --history --limit 20            # just the last twenty
+hsql -P prod --history               # only what ran against that database
+hsql --history-search line_items     # every query that mentions it, any database
+hsql --history -x --limit 1          # the last one, field by field
+hsql --history --jsonl               # one JSON object per row, for a pipe
+```
+
+Eight columns: `run_at` (UTC), `program` (`hsql` or `harlequin`), `profile`, `adapter`,
+`status` (`ok`, `error` or `canceled`), `rows`, `elapsed_ms`, and `sql`. The SQL is
+exactly what ran, so you can run it again: a query written over several lines is printed
+over several, with `+` marking each one that continues. Use `--jsonl` if you are feeding
+it to another program — `-tA` prints those newlines as they are, so one query is more
+than one line.
+
+`-P`, `-a` or a CONN_STR narrows the listing to that one database. With none of them —
+including when a config file names a `default_profile` — every database you have used is
+in it, and the `profile` and `adapter` columns are what tell them apart. A profile that
+reaches its database through an SSH tunnel is not narrowed either, and says so on
+stderr: naming that connection would mean opening the tunnel. `--limit` defaults to
+`500` and means "the most recent N".
+
+Neither mode connects to a database or opens a tunnel, so both work when the warehouse
+is down or you have no credentials for it. `--no-write-history` keeps one run out of
+the record.
+
+## Running statements
+
+```bash
+hsql -P prod -c "select * from orders limit 10"
+hsql -P prod -f ./report.sql
+cat report.sql | hsql -P prod -f -
+hsql -P prod -f ./setup.sql -c "select count(*) from staged" -f ./build.sql
+```
+
+`-c` and `-f` both repeat, both accept several statements separated by `;`, and they run
+in the order they were typed. `--result` picks what reaches stdout when there is more
+than one result set:
+
+- `--result all` (the default) emits every result set. Only the layouts and `jsonl`
+  can hold more than one; `csv`, `json` and `parquet` exit `2` rather than silently
+  concatenating.
+- `--result last` emits only the final one — the usual choice for a setup script that
+  ends in a `select`.
+- `--result 2` emits the second.
+
+`--on-error stop` (the default) stops at the first failure; `--on-error continue` runs
+the rest and still exits non-zero.
+
+## Choosing a format
+
+`--format NAME` takes `table`, `markdown` (`md`), `vertical`, `csv`, `tsv`, `json`,
+`jsonl` (`ndjson`), `parquet`, `orc`, `feather` (`arrow`), or `none`. Five have a
+shorthand flag: `--csv`, `--json`, `--jsonl`, `--markdown`, `--vertical` (also `-x`).
+
+| you want | use |
+| --- | --- |
+| one value for a shell variable | `-tAc "select …"` |
+| a few rows you will read yourself | the default `table` |
+| rows to paste into your reply | `--markdown` |
+| a wide row you need to read field by field | `-x` |
+| input for another program | `--csv`, or `--jsonl` |
+| more rows than you want in a terminal | `--format parquet -o out.parquet` |
+| the run's side effects, not its rows | `--format none` |
+
+Layout switches are independent: `-t` drops the header and footer, `-A` drops the column
+alignment, `--no-header` / `--no-footer` drop one apiece, `--null-string TEXT` sets how
+NULL prints. `-tAc` is those first two plus `-c`, and prints a bare value.
+
+## Limits, and the two kinds
+
+`--limit N` is the hard one: the database returns at most N rows. It defaults to `500`.
+`--limit -1` is unlimited, and is what you want before any aggregate you compute
+yourself.
+
+`--display-rows N` is soft: hsql fetched the rows and prints N of them. It only applies
+to the text layouts (`table` and `md` print 40, `vertical` prints 10) and never changes
+a file format's contents.
+
+`--stats` reports both, on stderr, as one line of JSON:
+
+```bash
+$ hsql -c "select 1" --stats --format none
+{"status":"ok","statements":1,"rows":1,"truncated":false,"limit":500,"elapsed_ms":1,"columns":[{"name":"1","type":"#"}]}
+```
+
+`"truncated": true` means the limit cut the result short and the numbers you are about
+to report are wrong. Re-run with `--limit -1`, or aggregate in SQL instead.
+
+## Writing to a file
+
+`-o PATH` writes to a file; `-o DIR/` writes one file per result set, named for you, and
+says on stderr what it called them. The bytes are identical to a shell redirect, so
+`-o out.csv` and `> out.csv` agree.
+
+```bash
+hsql -P prod --limit -1 -c "select * from users" --format parquet -o users.parquet
+hsql -P prod --limit -1 -f ./three_reports.sql --csv -o ./out/
+```
+
+stdout carries data and nothing else. Every note, warning and error goes to stderr.
